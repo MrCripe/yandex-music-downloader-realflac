@@ -308,9 +308,11 @@ def set_tags(
     tag.save()
 
 
+import subprocess
+
 def download_track(
     track_info: DownloadableTrack,
-    cover_resolution: int = DEFAULT_COVER_RESOLUTION,
+    cover_resolution: Union[int, str] = DEFAULT_COVER_RESOLUTION, # Разрешаем строку для "original"
     lyrics_format: LyricsFormat = LyricsFormat.NONE,
     embed_cover: bool = False,
     covers_cache: Optional[dict[int, AlbumCover]] = None,
@@ -324,37 +326,39 @@ def download_track(
     client = typing.cast(Client, track.client)
     assert client
 
+    # --- Обработка лирики ---
     text_lyrics = None
     if lyrics_format != LyricsFormat.NONE and (lyrics_info := track.lyrics_info):
         if lyrics_format == LyricsFormat.LRC and lyrics_info.has_available_sync_lyrics:
             lrc_path = target_path.with_suffix(".lrc")
-            if not lrc_path.is_file() and (
-                track_lyrics := track.get_lyrics(format_="LRC")
-            ):
+            if not lrc_path.is_file() and (track_lyrics := track.get_lyrics(format_="LRC")):
                 lyrics = track_lyrics.fetch_lyrics()
                 write_via_temporary_file(lyrics.encode("utf-8"), lrc_path)
         elif lyrics_info.has_available_text_lyrics:
             if track_lyrics := track.get_lyrics(format_="TEXT"):
                 text_lyrics = track_lyrics.fetch_lyrics()
 
+    # --- Обработка обложки ---
     cover = None
     if track.cover_uri is not None:
-        if cover_resolution == -1:
+        # Корректная обработка "original" или -1
+        if cover_resolution == -1 or cover_resolution == "original":
             cover_size = "orig"
         else:
             cover_size = f"{cover_resolution}x{cover_resolution}"
+            
         cover_bytes = track.download_cover_bytes(size=cover_size)
         mime_type = guess_mime_type(cover_bytes)
         if mime_type is None:
             raise RuntimeError("Unknown cover mime type")
         album_cover = AlbumCover(data=cover_bytes, mime_type=mime_type)
+        
         if embed_cover:
             album = track.albums[0] if track.albums else Album()
             if album.id and (cached_cover := covers_cache.get(album.id)):
                 cover = cached_cover
-            else:
-                if album.id:
-                    cover = covers_cache[album.id] = album_cover
+            elif album.id:
+                cover = covers_cache[album.id] = album_cover
         else:
             mime_suffix_dict = {MimeType.JPEG: ".jpg", MimeType.PNG: ".png"}
             file_suffix = mime_suffix_dict.get(album_cover.mime_type)
@@ -364,20 +368,42 @@ def download_track(
             if not cover_path.is_file():
                 write_via_temporary_file(album_cover.data, cover_path)
 
+    # --- Загрузка данных ---
     download_info = track_info.download_info
     track_data = api.download_track(client, download_info)
 
-    write_via_temporary_file(
-        track_data,
-        target_path,
-        temporary_file_hook=lambda tmp_path: set_tags(
+    # --- Хук для обработки файла (FFMPEG + Tags) ---
+    def process_hook(tmp_path: Path):
+        container = download_info.file_format.container
+        
+        # Если это псевдо-FLAC (MP4 внутри), перепаковываем в настоящий FLAC
+        if container == Container.MP4 and target_path.suffix == ".flac":
+            fixed_tmp = tmp_path.with_suffix(".fixed.flac")
+            # -y (overwrite), -vn (no video/old cover), -c:a copy (no re-encode)
+            subprocess.run([
+                "ffmpeg", "-y", "-i", str(tmp_path),
+                "-vn",             # Удаляем видео-поток (старую обложку)
+                "-c:a", "copy",    # Копируем аудио без пересжатия
+                "-map_metadata", "-1", # Полностью игнорируем старые метаданные
+                str(fixed_tmp)
+            ], check=True, capture_output=True)
+            fixed_tmp.replace(tmp_path)
+            container = Container.FLAC # Теперь это честный FLAC
+
+        set_tags(
             tmp_path,
             track,
-            download_info.file_format.container,
+            container,
             text_lyrics,
             cover,
             compatibility_level,
-        ),
+        )
+
+    # Запуск записи
+    write_via_temporary_file(
+        track_data,
+        target_path,
+        temporary_file_hook=process_hook
     )
 
 
@@ -395,14 +421,14 @@ def to_downloadable_track(
     download_info = get_download_info(track, api_quality)
     container = download_info.file_format.container
 
-    if container == Container.MP3:
+    if quality == CoreTrackQuality.LOSSLESS:
+        suffix = ".flac"
+    elif container == Container.MP3:
         suffix = ".mp3"
     elif container == Container.MP4:
         suffix = ".m4a"
-    elif container == Container.FLAC:
-        suffix = ".flac"
     else:
-        raise RuntimeError("Unknown codec")
+        suffix = ".flac"
 
     target_path = str(base_path) + suffix
     return DownloadableTrack(
