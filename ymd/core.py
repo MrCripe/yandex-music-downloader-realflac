@@ -373,22 +373,32 @@ def download_track(
     track_data = api.download_track(client, download_info)
 
     # --- Хук для обработки файла (FFMPEG + Tags) ---
-    def process_hook(tmp_path: Path):
+    def process_hook(tmp_path: Path) -> Path:
+        nonlocal target_path
         container = download_info.file_format.container
+        final_path = target_path
         
         # Если это псевдо-FLAC (MP4 внутри), перепаковываем в настоящий FLAC
         if container == Container.MP4 and target_path.suffix == ".flac":
             fixed_tmp = tmp_path.with_suffix(".fixed.flac")
             # -y (overwrite), -vn (no video/old cover), -c:a copy (no re-encode)
-            subprocess.run([
-                "ffmpeg", "-y", "-i", str(tmp_path),
-                "-vn",             # Удаляем видео-поток (старую обложку)
-                "-c:a", "copy",    # Копируем аудио без пересжатия
-                "-map_metadata", "-1", # Полностью игнорируем старые метаданные
-                str(fixed_tmp)
-            ], check=True, capture_output=True)
-            fixed_tmp.replace(tmp_path)
-            container = Container.FLAC # Теперь это честный FLAC
+            try:
+                subprocess.run([
+                    "ffmpeg", "-y", "-i", str(tmp_path),
+                    "-vn",             # Удаляем видео-поток (старую обложку)
+                    "-c:a", "copy",    # Копируем аудио без пересжатия
+                    "-map_metadata", "-1", # Полностью игнорируем старые метаданные
+                    str(fixed_tmp)
+                ], check=True, capture_output=True)
+                fixed_tmp.replace(tmp_path)
+                container = Container.FLAC
+                final_path = target_path
+            except subprocess.CalledProcessError:
+                final_path = target_path.with_suffix('.m4a')
+                target_path = final_path
+                tmp_path.rename(final_path)
+                tmp_path = final_path
+                container = Container.MP4
 
         set_tags(
             tmp_path,
@@ -398,6 +408,8 @@ def download_track(
             cover,
             compatibility_level,
         )
+
+        return final_path
 
     # Запуск записи
     write_via_temporary_file(
@@ -420,15 +432,19 @@ def to_downloadable_track(
 
     download_info = get_download_info(track, api_quality)
     container = download_info.file_format.container
+    codec_name = download_info.file_format.codec.name.lower()
 
-    if quality == CoreTrackQuality.LOSSLESS:
-        suffix = ".flac"
-    elif container == Container.MP3:
+    if container == Container.MP3:
         suffix = ".mp3"
     elif container == Container.MP4:
-        suffix = ".m4a"
-    else:
+        if "flac" in codec_name:
+            suffix = ".flac"
+        else:
+            suffix = ".m4a"
+    elif container == Container.FLAC:
         suffix = ".flac"
+    else:
+        suffix = ".unknown"
 
     target_path = str(base_path) + suffix
     return DownloadableTrack(
@@ -441,7 +457,7 @@ def to_downloadable_track(
 def write_via_temporary_file(
     data: bytes,
     target_path: Path,
-    temporary_file_hook: Optional[Callable[[Path], None]] = None,
+    temporary_file_hook: Optional[Callable[[Path], Path]] = None,
 ) -> Path:
     target_name = hashlib.sha256(target_path.name.encode()).hexdigest()
     temporary_file = target_path.parent / (
@@ -450,9 +466,14 @@ def write_via_temporary_file(
     try:
         temporary_file.write_bytes(data)
         if temporary_file_hook is not None:
-            temporary_file_hook(temporary_file)
+            final_file = temporary_file_hook(temporary_file)
+        else:
+            final_file = target_path
     except InterruptedError as e:
         temporary_file.unlink()
         raise e
-    temporary_file.rename(target_path)
-    return target_path
+
+    if temporary_file.exists():
+        temporary_file.rename(final_file)
+
+    return final_file
