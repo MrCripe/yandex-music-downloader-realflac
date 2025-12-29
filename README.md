@@ -39,7 +39,7 @@
 ## Установка
 Для запуска скрипта требуется Python 3.9+
 ```
-pip install -U https://github.com/MrCripe/yandex-music-downloader-realflac/archive/refs/tags/xd.zip
+pip install -U https://github.com/MrCripe/yandex-music-downloader-realflac/archive/refs/heads/main.zip
 yandex-music-downloader --help
 ```
 
